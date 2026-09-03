@@ -422,15 +422,22 @@ class HybridBlock(nn.Module):
         self,
         hidden_size: int,
         mamba_mixer_cls: Any,
-        attn_mixer_cls: Any,
+        attn_mixer_cls: Any | None,
         norm_cls: Any,
     ) -> None:
-        """Initialize one hybrid block."""
+        """Initialize one block; ``attn_mixer_cls=None`` makes it pure Mamba.
+
+        A block with no attention branch has nothing to fuse, so it drops
+        :class:`MergeAttention` too and is a plain prenorm Mamba block. That
+        is the ``pure_mamba2`` arm: the same stack, same embeddings, same
+        state-passing, with decision (a) of research entry 03 flipped, so a
+        run can measure what the attention branch is actually buying.
+        """
         super().__init__()
         self.norm = norm_cls(hidden_size)
         self.mamba = mamba_mixer_cls(hidden_size)
-        self.attn = attn_mixer_cls(hidden_size)
-        self.merge = MergeAttention(hidden_size)
+        self.attn = attn_mixer_cls(hidden_size) if attn_mixer_cls is not None else None
+        self.merge = MergeAttention(hidden_size) if attn_mixer_cls is not None else None
 
     def forward(
         self,
@@ -446,6 +453,8 @@ class HybridBlock(nn.Module):
         )
         normed = self.norm(new_residual.to(dtype=self.norm.weight.dtype))
         mamba_out = self.mamba(normed, inference_params=mamba_inference_params)
+        if self.attn is None or self.merge is None:
+            return mamba_out, new_residual
         attn_out = self.attn(normed, inference_params=attn_inference_params)
         fused = self.merge(mamba_out, attn_out)
         return fused, new_residual
@@ -466,6 +475,7 @@ class EHRHybridBackbone(SequenceBackbone):
         attn_num_heads: int = 8,
         attn_num_heads_kv: int | None = None,
         norm_epsilon: float = 1e-5,
+        use_attention: bool = True,
         **embedding_kwargs: object,
     ) -> None:
         """Initialize the hybrid backbone.
@@ -473,6 +483,12 @@ class EHRHybridBackbone(SequenceBackbone):
         ``attn_num_heads_kv`` defaults to ``attn_num_heads`` (plain
         multi-head attention); set it lower for grouped-query attention,
         as Nemotron-H does (entry 03, Section 03).
+
+        ``use_attention=False`` drops the attention branch and the fusion from
+        every block, giving a pure Mamba-2 stack -- the ``pure_mamba2``
+        backbone in the registry. Everything else, including the carried
+        Mamba state, is unchanged, so the two arms differ in exactly the one
+        design decision under test.
         """
         try:
             # Deferred: mamba-ssm needs CUDA. See the module docstring.
@@ -508,12 +524,16 @@ class EHRHybridBackbone(SequenceBackbone):
                 headdim=mamba_headdim,
                 chunk_size=mamba_chunk_size,
             )
-            attn_cls = partial(
-                MHA,
-                num_heads=attn_num_heads,
-                num_heads_kv=attn_num_heads_kv,
-                layer_idx=layer_idx,
-                causal=True,
+            attn_cls = (
+                partial(
+                    MHA,
+                    num_heads=attn_num_heads,
+                    num_heads_kv=attn_num_heads_kv,
+                    layer_idx=layer_idx,
+                    causal=True,
+                )
+                if use_attention
+                else None
             )
             norm_cls = partial(RMSNorm, eps=norm_epsilon)
             return HybridBlock(hidden_size, mamba_cls, attn_cls, norm_cls)

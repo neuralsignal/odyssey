@@ -73,6 +73,7 @@ from torch import nn
 
 from odyssey.data.types import ClinicalSequenceBatch
 from odyssey.models.backbones.base import SequenceBackbone, TimeAwareState
+from odyssey.models.backbones.masks import MaskedAttentionMixin
 from odyssey.models.embeddings import CachedEHREmbeddings
 
 
@@ -115,80 +116,6 @@ class SwiGLU(nn.Module):
             F.silu(self.gate_proj(x)) * self.up_proj(x)
         )
         return result
-
-
-def _segment_ids(reset_mask: torch.Tensor) -> torch.Tensor:
-    """Return a per-position segment id: increments at every reset.
-
-    Only equality between two positions' ids is meaningful (whether they
-    belong to the same packed patient); the absolute values carry no
-    other information.
-    """
-    return torch.cumsum(reset_mask.long(), dim=1)
-
-
-def _position_ids(reset_mask: torch.Tensor) -> torch.Tensor:
-    """Return each position's index since its most recent reset (for RoPE).
-
-    Position 0 of every segment gets id 0, whether or not that segment is
-    the first in the row -- a packed patient's rotary angles are identical
-    to processing that same patient alone.
-    """
-    seq_len = reset_mask.shape[1]
-    idx = (
-        torch.arange(seq_len, device=reset_mask.device)
-        .unsqueeze(0)
-        .expand_as(reset_mask)
-    )
-    segment_start = torch.where(reset_mask, idx, torch.zeros_like(idx))
-    segment_start = torch.cummax(segment_start, dim=1).values
-    return idx - segment_start
-
-
-def _rebase_time_stamps(
-    time_stamps: torch.Tensor, reset_mask: torch.Tensor
-) -> torch.Tensor:
-    """Force every segment boundary's time delta to exactly 0, elsewhere unchanged.
-
-    :class:`~odyssey.models.embeddings.TimeEmbeddingLayer` computes
-    time-since-previous-event as a delta over the *whole row's* raw
-    timestamps, uniformly -- it has no notion of a packed segment
-    boundary. Left alone, a packed segment's own first position would get
-    whatever ``time_stamps[boundary] - time_stamps[boundary - 1]`` happens
-    to be: a value that depends on the *previous* segment's absolute
-    timestamps, exactly the cross-patient leakage this backbone must not
-    have. Zeroing the delta at every reset (matching the "fresh sequence
-    start" convention :class:`TimeEmbeddingLayer` already uses at row
-    position 0 when no ``prev_value`` is given) and reconstructing the
-    series by cumulative sum makes every non-boundary delta come out
-    identical to the original (nothing but the boundary deltas changes),
-    so this is a correction, not an approximation. Doing this inside the
-    backbone -- from ``reset_mask`` alone -- rather than trusting a caller
-    to have pre-shifted timestamps means the no-leakage guarantee holds
-    for *any* valid ``reset_mask``, not only ones a particular sampler
-    happens to construct carefully.
-    """
-    deltas = time_stamps[:, 1:] - time_stamps[:, :-1]
-    deltas = deltas.masked_fill(reset_mask[:, 1:], 0.0)
-    first = time_stamps[:, :1]
-    return torch.cat([first, first + torch.cumsum(deltas, dim=1)], dim=1)
-
-
-def _build_attn_mask(reset_mask: torch.Tensor) -> torch.Tensor:
-    """Return a ``(batch, 1, seq, seq)`` bool mask: True where attention is allowed.
-
-    Causal (position i may attend to position j <= i) AND same-segment
-    (i and j belong to the same packed patient) -- a block-diagonal causal
-    mask, block boundaries given by ``reset_mask``.
-    """
-    batch, seq_len = reset_mask.shape
-    segment = _segment_ids(reset_mask)
-    same_segment = segment.unsqueeze(2) == segment.unsqueeze(1)
-    causal = torch.tril(
-        torch.ones(seq_len, seq_len, dtype=torch.bool, device=reset_mask.device)
-    )
-    mask = same_segment & causal.unsqueeze(0)
-    return mask.unsqueeze(1).expand(batch, 1, seq_len, seq_len)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -290,8 +217,15 @@ class TransformerBlock(nn.Module):
         return result
 
 
-class TransformerBackbone(SequenceBackbone):
-    """A stack of modern-vanilla pre-norm transformer blocks. Stateless."""
+class TransformerBackbone(MaskedAttentionMixin, SequenceBackbone):
+    """A stack of modern-vanilla pre-norm transformer blocks. Stateless.
+
+    ``mode`` picks the context regime (``causal``, ``prefix``, ``encoder``)
+    and ``sparsity="bigbird"`` restricts attention to BigBird's global +
+    window + random receptive field; both are implemented entirely in
+    :mod:`odyssey.models.backbones.masks`, so this class is the same stack of
+    blocks either way and the arms stay comparable at matched depth and width.
+    """
 
     def __init__(  # noqa: PLR0917
         self,
@@ -303,6 +237,12 @@ class TransformerBackbone(SequenceBackbone):
         ffn_mult: int = 4,
         norm_epsilon: float = 1e-5,
         rope_theta: float = 10000.0,
+        mode: str = "causal",
+        prefix_fraction: float = 0.5,
+        sparsity: str | None = None,
+        block_size: int = 64,
+        num_global_blocks: int = 1,
+        num_random_blocks: int = 3,
         **embedding_kwargs: object,
     ) -> None:
         """Initialize the transformer backbone.
@@ -310,9 +250,18 @@ class TransformerBackbone(SequenceBackbone):
         Defaults mirror :class:`~odyssey.models.backbones.hybrid.EHRHybridBackbone`'s
         ``hidden_size``/``num_hidden_layers`` so the two backbones start
         from a comparable depth/width before either is deliberately tuned
-        to match the other's parameter count.
+        to match the other's parameter count. The BigBird block parameters
+        are ignored unless ``sparsity="bigbird"``.
         """
         super().__init__()
+        self._init_masking(
+            mode=mode,
+            prefix_fraction=prefix_fraction,
+            sparsity=sparsity,
+            block_size=block_size,
+            num_global_blocks=num_global_blocks,
+            num_random_blocks=num_random_blocks,
+        )
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
 
@@ -351,30 +300,14 @@ class TransformerBackbone(SequenceBackbone):
         is one segment, starting at position 0" -- the ordinary,
         one-patient-per-row case every existing test batch already uses.
         """
-        batch_size, seq_len = batch.concept_ids.shape
-
-        resolved_reset_mask: torch.Tensor = (
-            batch.concept_ids.new_zeros(batch_size, seq_len, dtype=torch.bool)
-            if reset_mask is None
-            else reset_mask
-        )
-        if seq_len > 0 and not bool(resolved_reset_mask[:, 0].all()):
-            resolved_reset_mask = resolved_reset_mask.clone()
-            resolved_reset_mask[:, 0] = True
-
-        aux = batch.aux
-        if seq_len > 0:
-            aux = aux._replace(
-                time_stamps=_rebase_time_stamps(aux.time_stamps, resolved_reset_mask)
-            )
-        self.embeddings.set_aux_inputs(aux, prev_time_stamps=None)
+        prepared = self.attention_inputs(batch, reset_mask)
+        self.embeddings.set_aux_inputs(prepared.aux, prev_time_stamps=None)
         hidden_states = self.embeddings(batch.concept_ids)
 
-        position_ids = _position_ids(resolved_reset_mask)
-        attn_mask = _build_attn_mask(resolved_reset_mask)
-
         for layer in self.layers:
-            hidden_states = layer(hidden_states, position_ids, attn_mask)
+            hidden_states = layer(
+                hidden_states, prepared.position_ids, prepared.attn_mask
+            )
         hidden_states = self.norm_f(hidden_states)
 
         new_state = TimeAwareState(

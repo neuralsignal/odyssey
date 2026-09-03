@@ -86,7 +86,12 @@ from odyssey.data.value_binning import (
 from odyssey.data.vocabulary import Vocabulary, code_type
 from odyssey.inference.baseline_features import StrongFeatureBuilder
 from odyssey.inference.baseline_features import feature_names as strong_feature_names
-from odyssey.inference.run_inference import load_run, refuse_existing_output
+from odyssey.inference.run_inference import (
+    _build_sampler,
+    load_run,
+    refuse_existing_output,
+)
+from odyssey.models.backbones import backbone_spec
 from odyssey.models.concept_bottleneck import BottleneckIntervention
 from odyssey.models.sequence_model import SequenceModel
 from odyssey.models.time_to_event import probability_within
@@ -446,13 +451,13 @@ def collect_model_scores(
     )
     rows: dict[str, list[IndexRow]] = {a.name: [] for a in alerts}
     patients = iter_patient_sequences(events_binned, vocab)
-    packed = backbone == "transformer"
-    sampler: PackedLaneSampler | PackedContextSampler = (
-        PackedContextSampler(patients, batch_size=num_lanes, max_context=max_context)
-        if packed
-        else PackedLaneSampler(
-            patients, num_lanes=num_lanes, chunk_size=chunk_size, reset_prob=0.0
-        )
+    packed = backbone_spec(backbone).stateless
+    sampler: PackedLaneSampler | PackedContextSampler = _build_sampler(
+        patients,
+        backbone=backbone,
+        num_lanes=num_lanes,
+        chunk_size=chunk_size,
+        max_context=max_context,
     )
 
     state = None
@@ -664,13 +669,13 @@ def collect_model_scores_at_rows(  # noqa: PLR0912, PLR0915
     unscoreable: list[tuple[int, int, float]] = []
 
     patients = iter_patient_sequences(events_binned, vocab)
-    packed = backbone == "transformer"
-    sampler: PackedLaneSampler | PackedContextSampler = (
-        PackedContextSampler(patients, batch_size=num_lanes, max_context=max_context)
-        if packed
-        else PackedLaneSampler(
-            patients, num_lanes=num_lanes, chunk_size=chunk_size, reset_prob=0.0
-        )
+    packed = backbone_spec(backbone).stateless
+    sampler: PackedLaneSampler | PackedContextSampler = _build_sampler(
+        patients,
+        backbone=backbone,
+        num_lanes=num_lanes,
+        chunk_size=chunk_size,
+        max_context=max_context,
     )
     carry: dict[int, _LaneCarry] = {}
 

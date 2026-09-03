@@ -116,6 +116,14 @@ class ForecastObjective:
     The default instance reproduces the original objective exactly.
     """
 
+    encoder_regime: bool = False
+    """Set when ``attention_mode="encoder"``: every position has attended over
+    the whole record, so forecast, time and value supervision would be reading
+    their own targets out of the input. The training loop acts on this via
+    :func:`odyssey.training.train.restrict_to_landmark`, which is where the
+    reasoning lives; the flag rides on the objective so both the training and
+    evaluation loops get it from the one place the objective is built."""
+
     bundle_invariant: bool = False
     family_weights: torch.Tensor | None = None
     token_types: torch.Tensor | None = None
@@ -360,6 +368,45 @@ class _SequenceModelBase(nn.Module):
             ignore_index=self.padding_idx,
         )
 
+    def _drop_prefix_positions(
+        self, chunk: StreamingChunk, event_targets: Optional["EventHazardTargets"]
+    ) -> tuple[StreamingChunk, Optional["EventHazardTargets"]]:
+        """Remove the bidirectional prefix from every next-event supervision.
+
+        Under ``attention_mode="prefix"`` each row is split at a random cut:
+        positions before it attend both ways, positions after it are causal.
+        The causal half is ordinary supervised territory -- that is the point
+        of the regime, and what separates it from ``encoder``. The prefix half
+        has read its own next token, so its forecast, time and value targets
+        are all in its input.
+
+        Called right after the forward, which is when
+        :attr:`~odyssey.models.backbones.base.SequenceBackbone.last_prefix_mask`
+        holds the cut that forward actually used. Backbones with no prefix
+        leave it ``None`` and this returns the chunk untouched, so every caller
+        can invoke it unconditionally.
+
+        Both ``real_mask`` and ``targets`` are cleared, matching
+        :meth:`compute_steering_loss`: the plain cross-entropy path scores
+        every non-padding target and never consults ``real_mask``. The event
+        hazards go too, even though their targets come from the onset tables
+        rather than from the sequence: a prefix position has read the rest of
+        the record, which may contain the event token itself.
+        """
+        prefix = getattr(self.backbone, "last_prefix_mask", None)
+        if prefix is None:
+            return chunk, event_targets
+        keep = ~prefix.to(chunk.real_mask.device)
+        scored = chunk._replace(
+            real_mask=chunk.real_mask & keep,
+            targets=chunk.targets.masked_fill(~keep, self.padding_idx),
+        )
+        if event_targets is None:
+            return scored, None
+        return scored, dataclasses.replace(
+            event_targets, at_risk=event_targets.at_risk & keep.unsqueeze(-1)
+        )
+
     def _streaming_task_loss(
         self,
         logits: torch.Tensor,
@@ -586,6 +633,7 @@ class BaselineSequenceModel(_SequenceModelBase):
         logits, hidden, new_state = self.forward_features(
             chunk.batch, state=state, reset_mask=chunk.reset_mask
         )
+        chunk, event_targets = self._drop_prefix_positions(chunk, event_targets)
         task_loss = self._streaming_task_loss(logits, chunk, objective)
         time_loss, _ = self._streaming_time_loss(self.time_head, hidden, chunk)
         event_loss = self._streaming_event_loss(self.event_heads, hidden, event_targets)
@@ -1036,6 +1084,7 @@ class ConceptBottleneckSequenceModel(_SequenceModelBase):
             intervention=intervention,
             teacher=teacher,
         )
+        chunk, event_targets = self._drop_prefix_positions(chunk, event_targets)
         next_token_loss = self._streaming_task_loss(logits, chunk, objective)
         head_feats = bottleneck_out.bottleneck
         time_loss, _ = self._streaming_time_loss(self.time_head, head_feats, chunk)

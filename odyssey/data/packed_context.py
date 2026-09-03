@@ -24,14 +24,15 @@ row, over one pass through the patient iterator.
 Cross-patient leakage: a packed patient's own hidden states must be
 identical to processing that patient alone, both at the attention level
 (no position may attend past its segment's start -- the block-diagonal
-mask :func:`~odyssey.models.backbones.transformer._build_attn_mask` builds
+mask :func:`~odyssey.models.backbones.masks.build_attn_mask` builds
 from ``reset_mask``) and at the embeddings level
 (:class:`~odyssey.models.embeddings.TimeEmbeddingLayer` computes
 time-since-previous-event as a delta over the whole row's raw timestamps,
 which would otherwise smear a segment boundary's delta across two
-different patients' clocks). ``TransformerBackbone`` owns both
-guarantees itself, from ``reset_mask`` alone
-(:func:`~odyssey.models.backbones.transformer._rebase_time_stamps`) --
+different patients' clocks). Every packing-aware backbone owns both
+guarantees itself, from ``reset_mask`` alone, through the shared
+:class:`~odyssey.models.backbones.masks.MaskedAttentionMixin`
+(:func:`~odyssey.models.backbones.masks.rebase_time_stamps`) --
 this sampler does not need to, and deliberately does not, pre-adjust
 timestamps before packing: patients are concatenated with their own raw
 values as :class:`~odyssey.data.sequences.PatientSequence` already
@@ -211,8 +212,20 @@ class PackedContextSampler:
         *,
         batch_size: int,
         max_context: int,
+        pack: bool = True,
     ) -> None:
-        """Initialize the sampler over an exhaustible iterator of patients."""
+        """Initialize the sampler over an exhaustible iterator of patients.
+
+        ``pack=False`` puts at most one patient in each row. Required by any
+        backbone whose receptive field cannot be cut at a segment boundary: a
+        recurrent scan (an SSM or an RNN) runs straight through ``reset_mask``
+        and there is no mask to stop it, so a packed neighbour would leak into
+        the next patient's state -- a failure that looks like a mediocre result
+        rather than a bug. Also required under ``attention_mode="encoder"``,
+        where the supervised position is the row's last real token and must
+        therefore belong to the patient being scored. Costs padding on short
+        patients; that is the price of the guarantee.
+        """
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         if max_context < 2:
@@ -223,6 +236,7 @@ class PackedContextSampler:
         self._patients = patients
         self.batch_size = batch_size
         self.max_context = max_context
+        self.pack = pack
         self._held: PatientSequence | None = None
         self._exhausted = False
         self.truncated_subject_ids: list[int] = []
@@ -272,8 +286,12 @@ class PackedContextSampler:
                 patient = self._next_patient()
                 if patient is None:
                     break
-                if len(row) == 0 or len(row) + len(patient) <= self.max_context:
+                if len(row) == 0 or (
+                    self.pack and len(row) + len(patient) <= self.max_context
+                ):
                     row.append_patient(patient)
+                    if not self.pack:
+                        break
                 else:
                     self._held = patient
                     break

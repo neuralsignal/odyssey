@@ -136,7 +136,14 @@ def numeric_canary(
     from odyssey.training.train import _move_chunk_to_device  # noqa: PLC0415
 
     g = torch.Generator().manual_seed(12345)
-    lanes, t = 2, 64
+    # 64 unless the backbone cannot take a row that wide. Most wrapped
+    # ``transformers`` families place positions with a learned table sized to
+    # the run's max_context, so a fixed-width probe overruns it on a
+    # short-context run. Backbones with no such limit (the hybrid, the native
+    # transformer's RoPE, the tiny GRU) declare no max_context and keep the
+    # original width, so their fingerprints are unchanged.
+    lanes = 2
+    t = min(64, int(getattr(getattr(model, "backbone", None), "max_context", 64)))
     batch = ClinicalSequenceBatch(
         concept_ids=torch.randint(1, max(vocab_size, 2), (lanes, t), generator=g),
         aux=AuxiliaryInputs(

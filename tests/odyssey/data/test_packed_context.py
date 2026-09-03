@@ -410,3 +410,58 @@ def test_time_stamps_survive_real_data_magnitude_at_double_precision() -> None:
     assert round(recovered, 6) == real_data_hours, (
         f"time_stamps lost precision in packing: {real_data_hours} -> {recovered}"
     )
+
+
+# ---------------------------------------------------------------------------
+# pack=False: one patient per row
+# ---------------------------------------------------------------------------
+
+
+def test_pack_false_gives_each_patient_its_own_row() -> None:
+    """Recurrent and scan backbones have no mask to separate packed patients.
+
+    An LSTM or a Mamba scan carries its hidden state straight across a segment
+    boundary, so a second patient in the same row would read the first one's
+    state with nothing able to stop it -- and the only symptom would be a
+    slightly better loss. Backbones that need this declare
+    ``one_patient_per_row=True`` in the registry.
+    """
+    sampler = PackedContextSampler(
+        _patients([_seq(1, 3), _seq(2, 4)]), batch_size=1, max_context=16, pack=False
+    )
+
+    chunk = sampler.next_chunk()
+
+    assert chunk is not None
+    subject_ids = chunk.subject_ids[0]
+    assert (subject_ids[:3] == 1).all()
+    assert (subject_ids[3:] == NO_SUBJECT).all()  # patient 2 did not join this row
+
+
+def test_pack_false_still_reaches_every_patient() -> None:
+    """One per row is a layout change, not a dropped patient."""
+    sampler = PackedContextSampler(
+        _patients([_seq(1, 3), _seq(2, 4), _seq(3, 5)]),
+        batch_size=1,
+        max_context=16,
+        pack=False,
+    )
+
+    seen = set()
+    for chunk in sampler:
+        ids = chunk.subject_ids[chunk.subject_ids != NO_SUBJECT]
+        seen.update(int(i) for i in ids.unique())
+
+    assert seen == {1, 2, 3}
+
+
+def test_pack_false_marks_exactly_one_patient_end_per_row() -> None:
+    """What the encoder regime supervises at: the row's single landmark."""
+    sampler = PackedContextSampler(
+        _patients([_seq(1, 3), _seq(2, 4)]), batch_size=2, max_context=16, pack=False
+    )
+
+    chunk = sampler.next_chunk()
+
+    assert chunk is not None
+    assert chunk.patient_end.sum(dim=1).tolist() == [1, 1]

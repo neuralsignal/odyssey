@@ -858,10 +858,22 @@ def _build_sampler(
     -- see :mod:`odyssey.data.packed_context`. Picked from the run's own
     saved config, never a caller-supplied flag: there is no correct
     choice a caller could get wrong instead.
+
+    Both facts come from :data:`odyssey.models.backbones.BACKBONES`, the same
+    place training reads them, so adding a backbone does not mean remembering
+    to add it here too. That was the failure mode of the old
+    ``backbone == "transformer"`` test: a second stateless backbone would have
+    been handed a TBTT sampler and silently restarted its state every chunk.
     """
-    if backbone == "transformer":
+    from odyssey.models.backbones import backbone_spec  # noqa: PLC0415
+
+    spec = backbone_spec(backbone)
+    if spec.stateless:
         return PackedContextSampler(
-            patients, batch_size=num_lanes, max_context=max_context
+            patients,
+            batch_size=num_lanes,
+            max_context=max_context,
+            pack=not spec.one_patient_per_row,
         )
     return PackedLaneSampler(
         patients, num_lanes=num_lanes, chunk_size=chunk_size, reset_prob=0.0

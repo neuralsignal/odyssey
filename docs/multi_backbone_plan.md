@@ -309,3 +309,88 @@ through one config field.
    gated behind an explicit opt-in.
 3. **Does `prefix` (Phase 6) earn a slot**, or is `causal` vs `encoder` the whole
    question worth measuring?
+
+---
+
+# Implementation record
+
+All six phases are implemented. What follows is what actually landed, where it
+differs from the plan above, and what is still open.
+
+## What each phase became
+
+| Phase | Landed as | Note |
+|---|---|---|
+| 0 | `odyssey/models/backbones/__init__.py` — `BackboneSpec`, `BACKBONES`, `backbone_spec`, `validate_backbone` | 12 arms registered |
+| 1 | `odyssey/models/backbones/hf.py` — `HFBackbone` | `bert`, `cehr_bert`, `roberta`, `gpt2`, `llama` |
+| 2 | `odyssey/models/backbones/recurrent.py` — `RecurrentBackbone` | `lstm`, causal and bidirectional |
+| 3 | `restrict_to_landmark` in `train.py`, `ForecastObjective.encoder_regime` | applied in both the train and eval loops |
+| 4 | `odyssey/models/backbones/ehr_mamba.py`; `use_attention=False` on `EHRHybridBackbone` | `ehr_mamba`, `pure_mamba2`; CUDA-only, untested on this host |
+| 5 | `sparsity="bigbird"` on `TransformerBackbone`, via `masks.bigbird_block_mask` | landed with the mask refactor |
+| 6 | `SequenceBackbone.last_prefix_mask` + `_SequenceModelBase._drop_prefix_positions` | `prefix` on any masked arm |
+
+The mask arithmetic every attention arm shares moved to
+`odyssey/models/backbones/masks.py` (`MaskedAttentionMixin`). That was not a
+planned phase; it fell out of needing the native transformer, BigBird and every
+wrapped HF family to mean the same thing by `causal` / `prefix` / `encoder`.
+
+## Four things the plan had wrong
+
+**Phase 3 was smaller than budgeted, and for a reason worth keeping.** The
+concept bottleneck already pools at `chunk.patient_end` (`_pool_patient_ends`),
+which under a landmark-truncated record *is* the landmark. So the regime needed
+no new pooling path — only the removal of the leaky supervision. The whole
+change is `restrict_to_landmark`: empty `real_mask` and `targets`, and intersect
+the event hazards' `at_risk` with `patient_end`. Every loss then takes its own
+already-existing zero-graph branch.
+
+**Phase 6 needed a hand-off the plan did not anticipate.** The prefix cut is
+drawn inside the backbone's forward, so the loss cannot know where it fell.
+`MaskedAttentionMixin` records it on `self.last_prefix_mask` and
+`_drop_prefix_positions` reads it immediately after the forward, inside
+`compute_streaming_loss`. Declared on `SequenceBackbone` with a `None` default,
+so the loss can ask any backbone without knowing its kind.
+
+**HF families do not scale their MLP with `hidden_size`.** Every family ships an
+`intermediate_size` tuned for its own published width — BERT 3072, Llama 11008 —
+and ignores whatever `hidden_size` is asked for. Unpatched, a 256-wide "small"
+Llama arm carries an 11008-wide MLP: no error, no warning, and a parameter
+budget several times the hybrid it is supposed to be matched against. Measured at
+`hidden_size=32`, 2 layers: bert 434,624 and llama 2,145,152 params against
+gpt2's 50,784 (GPT-2 derives its own from `n_embd`). `_scale_feedforward` fixes
+it and `test_hf.py::test_feedforward_width_follows_hidden_size` holds it there —
+all four families now land within 30k–35k at those settings.
+
+**`numeric_canary` probed at a fixed 64 tokens.** Fine for every backbone that
+places positions with RoPE or a scan, fatal for a wrapped family whose learned
+position table is sized to `max_context`: a short-context run died on an
+out-of-range index inside `transformers`. The canary now probes at
+`min(64, backbone.max_context)`, and `HFBackbone.forward` raises a legible error
+instead of letting the index go through. Backbones that declare no `max_context`
+keep the original width, so their fingerprints are unchanged.
+
+## Open decisions, updated
+
+1. **Landmark budget for `encoder` arms — still open, still wanted before the
+   first encoder arm trains at scale.** Nothing in the implementation forces a
+   choice, which is exactly why it can be forgotten.
+2. **Which HF families to expose — resolved by construction.** Every family is
+   probed at build time: `HFBackbone.assert_no_leakage` perturbs the input past a
+   cut and asserts the earlier hidden states are bit-identical. A family that
+   ignores our 4D mask fails there rather than training a model that has seen the
+   future. `REFUSED` names the seven families that cannot work at all, each with
+   the alternative to use instead. No whitelist to rot.
+3. **Does `prefix` earn a slot — implemented, unmeasured.** It costs one config
+   value and reuses the whole `encoder` mechanism. Whether it is worth *running*
+   is still an empirical question, and this record is not evidence either way.
+
+## Not done
+
+- The Mamba arms (`ehr_mamba`, `pure_mamba2`) are CUDA-only and have never been
+  executed — `mamba-ssm` will not build on this host. They are ported, not
+  validated.
+- `case_study`, `concept_attribution` and `interventions` refuse stateless
+  backbones rather than supporting them. They drive the TBTT lane sampler, which
+  is not the context those arms trained on; the refusals say so and name why.
+- Landmark evaluation for `encoder` arms still costs one forward per landmark.
+  `alerts.py` has not been changed.

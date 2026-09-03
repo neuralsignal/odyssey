@@ -296,3 +296,75 @@ def test_packed_patient_matches_processing_alone() -> None:
     alone_out, _ = backbone(patient_a)
 
     assert torch.allclose(packed_out[:, :len_a], alone_out, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# BigBird receptive field (sparsity="bigbird")
+# ---------------------------------------------------------------------------
+
+
+def _make_bigbird(mode: str = "causal") -> TransformerBackbone:
+    return TransformerBackbone(
+        vocab_size=VOCAB_SIZE,
+        hidden_size=HIDDEN_SIZE,
+        num_hidden_layers=2,
+        num_heads=NUM_HEADS,
+        padding_idx=PADDING_IDX,
+        mode=mode,
+        sparsity="bigbird",
+        block_size=4,
+        num_global_blocks=1,
+        num_random_blocks=1,
+    ).eval()
+
+
+def test_bigbird_arm_is_still_causal() -> None:
+    """Sparsity narrows the receptive field; it must not widen it.
+
+    HF's own BigBird refuses to be a block-sparse decoder at all
+    (``modeling_big_bird.py``: "BigBird cannot be used as a decoder when
+    config.attention_type != original_full"), which is why the receptive field
+    is expressed here as a mask over ordinary attention rather than borrowed.
+    That makes this test the thing standing between us and a bidirectional
+    model wearing a causal arm's name.
+    """
+    backbone = _make_bigbird()
+    cut = 16
+    original = _make_batch(2, 32, seed=5)
+    perturbed = _make_batch(2, 32, seed=5)
+    perturbed.concept_ids[:, cut:] = (perturbed.concept_ids[:, cut:] % 13) + 20
+
+    with torch.no_grad():
+        before, _ = backbone(original)
+        after, _ = backbone(perturbed)
+
+    torch.testing.assert_close(before[:, :cut], after[:, :cut])
+
+
+def test_bigbird_does_not_leak_across_packed_patients() -> None:
+    """The random blocks are drawn over the row; the segment mask still wins."""
+    backbone = _make_bigbird()
+    batch = _make_batch(1, 32, seed=6)
+    reset_mask = torch.zeros(1, 32, dtype=torch.bool)
+    reset_mask[0, 0] = True
+    reset_mask[0, 16] = True
+
+    with torch.no_grad():
+        packed, _ = backbone(batch, reset_mask=reset_mask)
+        changed = _make_batch(1, 32, seed=6)
+        changed.concept_ids[:, :16] = (changed.concept_ids[:, :16] % 17) + 20
+        after, _ = backbone(changed, reset_mask=reset_mask)
+
+    torch.testing.assert_close(packed[:, 16:], after[:, 16:])
+
+
+def test_bigbird_eval_receptive_field_is_deterministic() -> None:
+    """Random blocks resampled per eval call would make a score unreproducible."""
+    backbone = _make_bigbird()
+    batch = _make_batch(2, 32, seed=7)
+
+    with torch.no_grad():
+        first, _ = backbone(batch)
+        second, _ = backbone(batch)
+
+    torch.testing.assert_close(first, second)

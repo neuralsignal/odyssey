@@ -51,6 +51,7 @@ from odyssey.data.streaming import PackedLaneSampler
 from odyssey.data.value_binning import add_value_tokens
 from odyssey.data.vocabulary import Vocabulary
 from odyssey.inference.run_inference import load_run, refuse_existing_output
+from odyssey.models.backbones import backbone_spec
 from odyssey.models.concept_bottleneck import ConceptBottleneck
 from odyssey.models.sequence_model import ConceptBottleneckSequenceModel
 from odyssey.training.data import iter_patient_sequences, load_meds_shards
@@ -411,10 +412,13 @@ def evaluate_attribution(
             "this analysis needs a concept bottleneck; the run's model_kind is "
             f"{getattr(config, 'model_kind', 'bottleneck')!r}"
         )
-    if getattr(config, "backbone", "hybrid") == "transformer":
+    backbone = getattr(config, "backbone", "hybrid")
+    if backbone_spec(backbone).stateless:
         raise NotImplementedError(
-            "concept_attribution is not wired for backbone='transformer': "
-            "like interventions, this is concept-bottleneck-lever tooling."
+            f"concept_attribution is not wired for backbone={backbone!r}: it "
+            "drives the TBTT lane sampler, which is not how a stateless "
+            "backbone was trained. Like case_study, this is "
+            "concept-bottleneck-lever tooling."
         )
 
     source = getattr(config, "source", "mimic_iv")

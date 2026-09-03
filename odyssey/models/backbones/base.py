@@ -75,6 +75,16 @@ class SequenceBackbone(nn.Module, ABC):
     """
 
     hidden_size: int
+
+    last_prefix_mask: torch.Tensor | None = None
+    """``(batch, seq)`` True where the last ``forward`` treated a position as
+    part of a bidirectional prefix, or ``None`` for every backbone and regime
+    that has no prefix -- which is all of them but
+    :class:`~odyssey.models.backbones.masks.MaskedAttentionMixin` under
+    ``mode="prefix"``. Declared here so the loss can ask any backbone without
+    knowing which kind it is, and defaulted to ``None`` so the answer is
+    "no prefix" rather than an ``AttributeError``."""
+
     embeddings: CachedEHREmbeddings
     """Every concrete backbone (hybrid, transformer, the tiny-GRU CPU
     stand-in) assigns this in ``__init__`` -- declared here, not just
