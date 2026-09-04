@@ -86,10 +86,27 @@ uv run python -c "import transformers"       # only if you installed the text ex
 uv run pytest -m "not integration_test" tests/ -q
 ```
 
-**The transformer, BigBird, LSTM and every `transformers` arm need no CUDA
-build at all** -- they are plain PyTorch. If you are not training a Mamba arm,
-skip the `cuda` extra entirely and skip the build pain with it. A GPU still
-helps; `mamba-ssm` is what needs `nvcc`, not the GPU.
+**The `cuda` extra is misnamed: it is the *Mamba* extra.** It contains
+`mamba-ssm` and `einops`, nothing else. Every arm runs on the GPU, and on
+Linux the base `uv sync --dev` already installs a CUDA build of torch
+(`torch==2.6.0` from the `pytorch-cu124` index, per `[tool.uv.sources]`), so
+`torch.cuda.is_available()` is `True` without the extra.
+
+What the extra buys is `mamba-ssm`'s hand-written CUDA kernels, which need
+`nvcc` to compile. The transformer, BigBird, LSTM and every `transformers`
+arm are plain PyTorch ops that go through cuDNN and SDPA -- they want a GPU
+just as much, they just do not need anything built from source to use one.
+If you are not training a Mamba arm, skip the extra and the build pain with
+it; you keep the GPU.
+
+Two consequences worth planning around:
+
+- The attention arms are the ones most *limited* by GPU memory, not least:
+  attention is quadratic in `max_context`, so the window you can afford is a
+  hardware question. The Mamba arms scale linearly and care less.
+- The `torch==2.6.0` Linux pin exists solely for `mamba-ssm` ABI
+  compatibility. It applies to every install regardless, which is harmless
+  but means a non-Mamba host is on an older torch than it strictly needs.
 
 ## 4. Extract to MEDS
 
