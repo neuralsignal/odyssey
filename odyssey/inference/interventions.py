@@ -98,6 +98,7 @@ from odyssey.inference.run_inference import (
     load_run,
     refuse_existing_output,
 )
+from odyssey.models.backbones import backbone_spec
 from odyssey.models.concept_bottleneck import (
     BottleneckIntervention,
     intervention_apply_mask,
@@ -518,16 +519,28 @@ def evaluate_interventions(
             "this evaluation needs a concept bottleneck; the run's model_kind is "
             f"{getattr(config, 'model_kind', 'bottleneck')!r}"
         )
-    if getattr(config, "backbone", "hybrid") == "transformer":
-        # The TBTT stream below is the same one the transformer trained on:
-        # its ``state`` is an inert sentinel and every chunk is its own
-        # context window, so a stateless backbone sees exactly the context
-        # it was optimized for. What differs from run_inference/alerts is
-        # only that those hand the transformer whole-patient context
-        # (PackedContextSampler); the lever test keeps training's view.
+    backbone = getattr(config, "backbone", "hybrid")
+    spec = backbone_spec(backbone)
+    if spec.one_patient_per_row:
+        raise NotImplementedError(
+            f"interventions is not wired for backbone={backbone!r}: it was "
+            "trained one whole patient per row, so the TBTT stream below "
+            "would hand it records cut mid-way with no state carried across "
+            "the cut -- a context it never saw. The stateless arms that pack "
+            "several patients into a context window (e.g. 'transformer') are "
+            "fine here; this one is not."
+        )
+    if spec.stateless:
+        # The TBTT stream below is the same one these backbones trained on:
+        # ``state`` is an inert sentinel and every chunk is its own context
+        # window, so a stateless backbone sees exactly the context it was
+        # optimized for. What differs from run_inference/alerts is only that
+        # those hand it whole-patient context (PackedContextSampler); the
+        # lever test keeps training's view.
         logger.info(
-            "[interventions] backbone='transformer': chunks of %d tokens are "
-            "independent context windows, as in training",
+            "[interventions] backbone=%r is stateless: chunks of %d tokens "
+            "are independent context windows, as in training",
+            backbone,
             chunk_size,
         )
 

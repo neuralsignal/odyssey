@@ -47,9 +47,10 @@ import gc
 import itertools
 import json
 import logging
+import random
 import time
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import (
     Any,
@@ -69,6 +70,11 @@ from odyssey.data.sidecars import activate_sidecars, active_sidecar_names
 from odyssey.data.streaming import PackedLaneSampler, StreamingChunk
 from odyssey.data.value_binning import CLIP_TAIL, QuantileBinner, add_value_tokens
 from odyssey.data.vocabulary import PAD_ID, Vocabulary
+from odyssey.models.backbones import (
+    BIDIRECTIONAL_MODES,
+    BackboneSpec,
+    validate_backbone,
+)
 from odyssey.models.backbones.base import TimeAwareState
 from odyssey.models.concept_bottleneck import (
     ConceptBottleneckLossWeights,
@@ -97,7 +103,11 @@ from odyssey.training.data import (
     load_meds_shards,
     token_type_lookup,
 )
-from odyssey.training.event_targets import EventTimeTables, event_hazard_targets
+from odyssey.training.event_targets import (
+    EventHazardTargets,
+    EventTimeTables,
+    event_hazard_targets,
+)
 from odyssey.training.lifted_tokens import lifted_token_sets
 from odyssey.training.running_labels import randint_intervention
 from odyssey.training.shard_stream import (
@@ -127,6 +137,100 @@ logger = logging.getLogger(__name__)
 StreamingSampler = PackedLaneSampler | PackedContextSampler
 
 
+def truncate_at_random_position(
+    patients: Iterator[PatientSequence], seed: int
+) -> Iterator[PatientSequence]:
+    """Cut each patient at a uniformly random position, keeping the head.
+
+    The ``encoder`` regime supervises one position per row -- the row's last
+    real token -- because that is the only position a bidirectional model can
+    score without having read its own future. Left alone, that position would
+    always be the record's true end: one landmark per patient, and an
+    unrepresentative one (every patient scored at discharge or death). Cutting
+    at a random position instead makes the supervised landmark different every
+    epoch, which is the same sampling logic
+    :func:`~odyssey.inference.alerts._landmark_mask` applies at evaluation,
+    approximated by uniform sampling rather than enumerated.
+
+    Kept as a generator over the patient iterator rather than an option inside
+    :class:`~odyssey.data.packed_context.PackedContextSampler`: the sampler's
+    job is packing, and truncation composes with it without either knowing
+    about the other.
+    """
+    rng = random.Random(seed)
+    for patient in patients:
+        length = len(patient)
+        if length < 2:
+            continue
+        yield patient.head(rng.randrange(2, length + 1))
+
+
+def make_context_sampler(
+    patients: Iterator[PatientSequence],
+    config: "TrainingConfig",
+    spec: BackboneSpec,
+    *,
+    seed: int,
+) -> PackedContextSampler:
+    """Build the packed-context sampler for one stateless backbone.
+
+    Two decisions come from the backbone's own declared capabilities rather
+    than from its name: whether several patients may share a row (``pack``),
+    and whether records get cut at a random landmark first (``encoder`` only).
+    """
+    if config.attention_mode == "encoder" and config.encoder_truncate:
+        patients = truncate_at_random_position(patients, seed)
+    return PackedContextSampler(
+        patients,
+        batch_size=config.num_lanes,
+        max_context=config.max_context,
+        pack=not spec.one_patient_per_row,
+    )
+
+
+def restrict_to_landmark(
+    chunk: StreamingChunk, event_targets: EventHazardTargets | None
+) -> tuple[StreamingChunk, EventHazardTargets | None]:
+    """Cut a chunk's supervision down to what a bidirectional pass may learn.
+
+    Under ``attention_mode="encoder"`` every position has attended over the
+    whole record, so any target that lies *later* in that record is already in
+    the model's input. Next-event forecasting, the time-to-next-event hazard
+    and the next-event value head are all such targets at every position but
+    the last, and none of them would fail loudly -- the loss would fall,
+    the metrics would improve, and the model would have learned to read ahead.
+    Research doc section 4.1: this leaks every head, not just the obvious one.
+
+    Two things survive, and they are the reason the regime exists:
+
+    * The **concept bottleneck**, which
+      :func:`~odyssey.models.sequence_model._pool_patient_ends` already pools
+      at ``patient_end`` -- the landmark itself, whose label depends on what
+      comes after the record, not inside it. No change needed here.
+    * The **per-event hazards**, whose targets come from the onset/censoring
+      tables rather than from the sequence. They are restricted to the
+      landmark position: ``at_risk`` is otherwise per-position with no mask at
+      all, which under this regime would supervise leaky positions and, with
+      ``pack=False`` rows, trailing padding as well.
+
+    Everything else is switched off by emptying ``real_mask`` and ``targets``
+    together -- both, because the plain cross-entropy path scores every
+    non-padding target and does not consult ``real_mask``. Each loss then
+    takes its own documented zero-graph branch, so ``backward()`` still runs.
+    """
+    empty = torch.zeros_like(chunk.real_mask)
+    scored = chunk._replace(
+        real_mask=empty,
+        targets=torch.full_like(chunk.targets, PAD_ID),
+    )
+    if event_targets is None:
+        return scored, None
+    return scored, replace(
+        event_targets,
+        at_risk=event_targets.at_risk & chunk.patient_end.unsqueeze(-1),
+    )
+
+
 @dataclass
 class TrainingConfig:
     """All paths and hyperparameters for one training run."""
@@ -147,21 +251,53 @@ class TrainingConfig:
     is measured, not assumed."""
 
     backbone: str = "hybrid"
-    """``"hybrid"`` (EHRHybridBackbone, Mamba-2 + attention, this project's
-    own architecture) or ``"transformer"``
-    (odyssey.models.backbones.transformer.TransformerBackbone, the
-    modern-vanilla decoder-only control -- roadmap Track A item 5). Both
-    share every downstream head/loss; this prices the backbone choice the
-    way model_kind prices the bottleneck. The transformer backbone is
-    stateless, so this loop drives it with
-    odyssey.data.packed_context.PackedContextSampler (whole/truncated
-    patients packed per row, num_lanes rows per step, no carried state)
-    instead of PackedLaneSampler's TBTT chunking (which "hybrid" still
-    uses)."""
+    """Which architecture to train: any key of
+    :data:`odyssey.models.backbones.BACKBONES` ("hybrid", "transformer",
+    "pure_mamba2", "ehr_mamba", "bigbird", "lstm", "bert", "cehr_bert",
+    "roberta", "gpt2", "llama", "tiny_gru"). Every arm shares the same
+    tokenization, heads and losses, so this prices the architecture choice
+    the way model_kind prices the bottleneck (roadmap Track A item 5).
+
+    A stateless arm (BackboneSpec.stateless) is driven by
+    odyssey.data.packed_context.PackedContextSampler -- whole or
+    head-truncated patients packed per row, num_lanes rows per step, no
+    carried state -- instead of PackedLaneSampler's TBTT chunking, which
+    the recurrent arms ("hybrid", "pure_mamba2", "tiny_gru") still use."""
+
+    attention_mode: str = "causal"
+    """What each position may see: "causal" (<= t; every head valid, and the
+    only regime that existed before the backbone registry), "prefix"
+    (bidirectional over a sampled prefix, causal after) or "encoder" (fully
+    bidirectional over a landmark-truncated record, supervised at its last
+    position only). The two bidirectional regimes disable the forecasting,
+    time-to-next-event and value heads on positions that can see their own
+    targets; see restrict_to_landmark (encoder) and
+    _SequenceModelBase._drop_prefix_positions (prefix).
+    Validated against the chosen backbone's declared modes at config time."""
+
+    prefix_fraction: float = 0.5
+    """attention_mode="prefix" only: the expected fraction of each row given
+    bidirectional context. The actual prefix length is sampled per row per
+    step in [0, 2 * prefix_fraction * length), clipped to the row, so the
+    model sees many prefix lengths rather than memorizing one boundary."""
+
+    encoder_truncate: bool = True
+    """attention_mode="encoder" only: cut each patient at a uniformly random
+    position before packing, so the supervised final position lands at a
+    different landmark every epoch. Off means always supervising the record's
+    true end, which is a single, unrepresentative landmark per patient."""
+
+    backbone_kwargs: dict[str, Any] = field(default_factory=dict)
+    """Free-form constructor overrides for the chosen backbone, so an arm can
+    carry its own hyperparameters (an HF model_type's intermediate_size, an
+    LSTM's dropout) without a TrainingConfig field per architecture. Merged
+    over the arm's own defaults. Round-trips through asdict into config.json
+    like every other field."""
 
     max_context: int = 4096
-    """Token budget per packed row for backbone="transformer" (see
-    PackedContextSampler). Unused by the hybrid backbone."""
+    """Token budget per packed row for every stateless backbone (see
+    PackedContextSampler). Unused by the recurrent arms, which chunk with
+    PackedLaneSampler instead."""
 
     # Backbone (EHRHybridBackbone). Defaults are modest, not the paper-scale
     # numbers -- see the training run's own README note on why.
@@ -615,44 +751,25 @@ def build_model(
     config: TrainingConfig, *, vocab_size: int, num_concepts: int
 ) -> SequenceModel:
     """Construct the real backbone + heads from ``config`` (see ``model_kind``)."""
+    from odyssey.models.backbones import validate_backbone  # noqa: PLC0415
     from odyssey.models.backbones.base import SequenceBackbone  # noqa: PLC0415
-    from odyssey.models.backbones.hybrid import EHRHybridBackbone  # noqa: PLC0415
-    from odyssey.models.backbones.transformer import (  # noqa: PLC0415
-        TransformerBackbone,
-    )
 
     kind = getattr(config, "model_kind", "bottleneck")
     if kind not in ("bottleneck", "baseline"):
         raise ValueError(f"model_kind must be 'bottleneck' or 'baseline', got {kind!r}")
-    backbone_kind = getattr(config, "backbone", "hybrid")
-    backbone: SequenceBackbone
-    if backbone_kind == "hybrid":
-        backbone = EHRHybridBackbone(
-            vocab_size=vocab_size,
-            hidden_size=config.hidden_size,
-            padding_idx=PAD_ID,
-            num_hidden_layers=config.num_hidden_layers,
-            mamba_state_size=config.mamba_state_size,
-            mamba_headdim=config.mamba_headdim,
-            mamba_chunk_size=config.mamba_chunk_size,
-            attn_num_heads=config.attn_num_heads,
-            use_values=bool(getattr(config, "value_embeddings", False)),
-            use_value_fourier=bool(getattr(config, "value_fourier", False)),
-        )
-    elif backbone_kind == "transformer":
-        backbone = TransformerBackbone(
-            vocab_size=vocab_size,
-            hidden_size=config.hidden_size,
-            padding_idx=PAD_ID,
-            num_hidden_layers=config.num_hidden_layers,
-            num_heads=config.attn_num_heads,
-            use_values=bool(getattr(config, "value_embeddings", False)),
-            use_value_fourier=bool(getattr(config, "value_fourier", False)),
-        )
-    else:
+    mode = getattr(config, "attention_mode", "causal")
+    spec = validate_backbone(getattr(config, "backbone", "hybrid"), mode)
+    if kind == "baseline" and mode in BIDIRECTIONAL_MODES:
         raise ValueError(
-            f"backbone must be 'hybrid' or 'transformer', got {backbone_kind!r}"
+            f"model_kind='baseline' cannot be trained under "
+            f"attention_mode={mode!r}: a bidirectional pass has seen its own "
+            f"forecast, time and value targets, so restrict_to_landmark "
+            f"switches all three off -- and the baseline model has no concept "
+            f"bottleneck or event heads left to supervise. The run would "
+            f"train on a zero loss without erroring. Use "
+            f"model_kind='bottleneck', or attention_mode='causal'."
         )
+    backbone: SequenceBackbone = spec.build(config, vocab_size=vocab_size)
     time_bin_edges = (
         DEFAULT_TIME_BIN_EDGES_HOURS
         if getattr(config, "time_to_event", False)
@@ -961,6 +1078,7 @@ def build_objective(
             {k: round(float(v), 2) for k, v in enumerate(family_weights.tolist()) if v},
         )
     return ForecastObjective(
+        encoder_regime=config.attention_mode == "encoder",
         bundle_invariant=config.bundle_invariant_loss,
         family_weights=family_weights,
         token_types=token_types,
@@ -985,6 +1103,9 @@ def evaluate_streaming(
     event_tables: EventTimeTables | None = None,
 ) -> dict[str, float]:
     """Average loss components over one (partial), gradient-free sampler pass."""
+    # Resolved here rather than deferred to compute_streaming_loss's own
+    # default, because the chunk restriction below reads it too.
+    objective = objective or ForecastObjective()
     model.eval()
     sampler = make_sampler()
     state = None
@@ -1000,6 +1121,10 @@ def evaluate_streaming(
                 if event_tables is not None
                 else None
             )
+            if objective.encoder_regime:
+                chunk, event_targets = restrict_to_landmark(  # noqa: PLW2901
+                    chunk, event_targets
+                )
             if isinstance(model, BaselineSequenceModel):
                 _, components, state = model.compute_streaming_loss(
                     chunk, state=state, objective=objective, event_targets=event_targets
@@ -1546,11 +1671,13 @@ def _run_training(  # noqa: PLR0912, PLR0915
             steps_into_epoch,
         )
 
+    backbone_spec = validate_backbone(config.backbone, config.attention_mode)
+
     def make_train_sampler(epoch: int) -> StreamingSampler:
         patients = corpus.make_train_patients(epoch)
-        if config.backbone == "transformer":
-            return PackedContextSampler(
-                patients, batch_size=config.num_lanes, max_context=config.max_context
+        if backbone_spec.stateless:
+            return make_context_sampler(
+                patients, config, backbone_spec, seed=config.seed + epoch
             )
         return PackedLaneSampler(
             patients,
@@ -1566,9 +1693,11 @@ def _run_training(  # noqa: PLR0912, PLR0915
             vocab,
             max_seq_len=config.max_seq_len,
         )
-        if config.backbone == "transformer":
-            return PackedContextSampler(
-                patients, batch_size=config.num_lanes, max_context=config.max_context
+        if backbone_spec.stateless:
+            # Fixed seed: the tuning split must be the same rows every epoch,
+            # or the val-loss curve measures the sampler, not the model.
+            return make_context_sampler(
+                patients, config, backbone_spec, seed=config.seed
             )
         return PackedLaneSampler(
             patients, num_lanes=config.num_lanes, chunk_size=config.chunk_size
@@ -1601,6 +1730,10 @@ def _run_training(  # noqa: PLR0912, PLR0915
                 if train_event_tables is not None
                 else None
             )
+            if objective.encoder_regime:
+                chunk, event_targets = restrict_to_landmark(  # noqa: PLW2901
+                    chunk, event_targets
+                )
             if isinstance(model, BaselineSequenceModel):
                 total, components, state = model.compute_streaming_loss(
                     chunk, state=state, objective=objective, event_targets=event_targets

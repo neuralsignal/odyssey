@@ -44,6 +44,7 @@ from odyssey.data.streaming import NO_SUBJECT, PackedLaneSampler
 from odyssey.data.value_binning import add_value_tokens
 from odyssey.data.vocabulary import Vocabulary
 from odyssey.inference.run_inference import load_run
+from odyssey.models.backbones import backbone_spec
 from odyssey.models.sequence_model import ConceptBottleneckSequenceModel
 from odyssey.models.time_to_event import probability_within
 from odyssey.training.data import build_concept_label_dicts, load_meds_shards
@@ -316,13 +317,15 @@ def build_case_studies(
             "this evaluation needs a concept bottleneck; the run's model_kind is "
             f"{getattr(config, 'model_kind', 'bottleneck')!r}"
         )
-    if getattr(config, "backbone", "hybrid") == "transformer":
+    backbone = getattr(config, "backbone", "hybrid")
+    if backbone_spec(backbone).stateless:
         raise NotImplementedError(
-            "case_study is not yet wired for backbone='transformer': this is "
+            f"case_study is not yet wired for backbone={backbone!r}: it drives "
+            "the TBTT lane sampler, and a stateless backbone was trained on "
+            "whole-patient context windows instead. This is "
             "concept-bottleneck-lever tooling, not needed for the backbone "
-            "control's own subset-scale comparison (unlike run_inference and "
-            "alerts, which are). Extend it only if the transformer backbone "
-            "earns longer-term status."
+            "comparison itself (unlike run_inference and alerts, which are). "
+            "Extend it only if a stateless arm earns longer-term status."
         )
 
     logger.info("[case_study] loading held-out shards from %s", held_out_shard_dir)
