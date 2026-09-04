@@ -169,7 +169,7 @@ def bigbird_block_mask(
     is_global = block < num_global_blocks
     glob = is_global.unsqueeze(2) | is_global.unsqueeze(1)
 
-    allowed = window | glob
+    allowed: torch.Tensor = window | glob
     if num_random_blocks > 0 and num_blocks > 1:
         scores = torch.rand(
             (batch, num_blocks, num_blocks),

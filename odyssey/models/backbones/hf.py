@@ -133,8 +133,9 @@ class HFBackbone(MaskedAttentionMixin, SequenceBackbone):
             ) from exc
 
         if model_type in REFUSED:
-            raise ValueError(f"model_type={model_type!r} is not supported: "
-                             f"{REFUSED[model_type]}")
+            raise ValueError(
+                f"model_type={model_type!r} is not supported: {REFUSED[model_type]}"
+            )
 
         super().__init__()
         self._init_masking(mode=mode, prefix_fraction=prefix_fraction)
@@ -190,7 +191,12 @@ class HFBackbone(MaskedAttentionMixin, SequenceBackbone):
         self._check_config_applied(config, hidden_size, num_hidden_layers, max_context)
         _scale_feedforward(config, hidden_size, ffn_mult, config_kwargs)
         _clamp_special_tokens(config, vocab_size, padding_idx)
-        self.model = AutoModel.from_config(config)
+        # AutoModel is typed only when the optional `transformers` extra is
+        # installed, so a direct call is a no-untyped-call error in one
+        # environment and clean in the other -- and a type: ignore for it is
+        # flagged unused in the second. An explicit Any alias is right in both.
+        auto_model: Any = AutoModel
+        self.model = auto_model.from_config(config)
 
         if verify_no_leakage and mode == "causal":
             self.assert_no_leakage()

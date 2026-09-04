@@ -63,7 +63,9 @@ def test_conforms_to_interface(mode: str) -> None:
 
     assert hidden_states.shape == (3, 12, HIDDEN_SIZE)
     assert isinstance(state, TimeAwareState)
-    assert torch.equal(state.prev_time_stamps, _make_batch(3, 12).aux.time_stamps[:, -1])
+    assert torch.equal(
+        state.prev_time_stamps, _make_batch(3, 12).aux.time_stamps[:, -1]
+    )
 
 
 def test_causal_mode_does_not_see_the_future() -> None:

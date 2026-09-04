@@ -271,7 +271,8 @@ class TrainingConfig:
     bidirectional over a landmark-truncated record, supervised at its last
     position only). The two bidirectional regimes disable the forecasting,
     time-to-next-event and value heads on positions that can see their own
-    targets; see odyssey.models.backbones and _supervised_position_mask.
+    targets; see restrict_to_landmark (encoder) and
+    _SequenceModelBase._drop_prefix_positions (prefix).
     Validated against the chosen backbone's declared modes at config time."""
 
     prefix_fraction: float = 0.5

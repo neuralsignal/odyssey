@@ -50,15 +50,15 @@ CAUSAL = "causal"
 PREFIX = "prefix"
 ENCODER = "encoder"
 
+#: Every context regime the training loop knows how to drive.
 ATTENTION_MODES: tuple[str, ...] = (CAUSAL, PREFIX, ENCODER)
-"""Every context regime the training loop knows how to drive."""
 
+#: Regimes in which some position sees a position after it. These are exactly
+#: the regimes where the forecasting, time-to-next-event and value heads would
+#: be supervised on tokens they can already see, so the training loop drops
+#: those losses -- ``odyssey.training.train.restrict_to_landmark`` for
+#: ``encoder``, ``_SequenceModelBase._drop_prefix_positions`` for ``prefix``.
 BIDIRECTIONAL_MODES: frozenset[str] = frozenset({PREFIX, ENCODER})
-"""Regimes in which some position sees a position after it. These are exactly
-the regimes where the forecasting, time-to-next-event and value heads would be
-supervised on tokens they can already see, so the training loop must mask (or
-disable) those losses -- see
-:func:`odyssey.training.train.supervised_position_mask`."""
 
 
 @dataclass(frozen=True)
@@ -223,9 +223,7 @@ def _build_recurrent(config: Any, *, vocab_size: int) -> "SequenceBackbone":
     )
 
 
-def _hf_builder(
-    model_type: str, **defaults: Any
-) -> Callable[..., "SequenceBackbone"]:
+def _hf_builder(model_type: str, **defaults: Any) -> Callable[..., "SequenceBackbone"]:
     """Return a builder for one ``transformers`` architecture.
 
     ``defaults`` are this arm's own hyperparameters (e.g. CEHR-BERT's published
@@ -293,8 +291,7 @@ def backbone_spec(name: str) -> BackboneSpec:
         return BACKBONES[name]
     except KeyError:
         raise ValueError(
-            f"unknown backbone {name!r}; registered: "
-            f"{', '.join(sorted(BACKBONES))}"
+            f"unknown backbone {name!r}; registered: {', '.join(sorted(BACKBONES))}"
         ) from None
 
 

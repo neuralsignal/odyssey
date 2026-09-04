@@ -109,9 +109,7 @@ class RecurrentBackbone(SequenceBackbone):
         # Trailing padding has to be excluded, not just ignored downstream: in
         # the bidirectional case the backward pass starts at the last column,
         # so padding would be the first thing every real position sees.
-        lengths = (
-            (batch.concept_ids != self.padding_idx).sum(dim=1).clamp(min=1).cpu()
-        )
+        lengths = (batch.concept_ids != self.padding_idx).sum(dim=1).clamp(min=1).cpu()
         packed = pack_padded_sequence(
             embeds, lengths, batch_first=True, enforce_sorted=False
         )
