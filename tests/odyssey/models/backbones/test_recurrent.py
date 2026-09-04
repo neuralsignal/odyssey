@@ -24,7 +24,7 @@ PADDING_IDX = 0
 def _make_batch(
     batch: int, seq_len: int, *, seed: int = 0, lengths: list[int] | None = None
 ) -> ClinicalSequenceBatch:
-    """A batch of random records, optionally right-padded to ``lengths``."""
+    """Build a batch of random records, optionally right-padded to ``lengths``."""
     gen = torch.Generator().manual_seed(seed)
     concept_ids = torch.randint(1, VOCAB_SIZE, (batch, seq_len), generator=gen)
     if lengths is not None:

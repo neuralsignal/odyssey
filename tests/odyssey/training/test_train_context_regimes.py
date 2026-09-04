@@ -19,14 +19,15 @@ import torch
 
 from odyssey.data.streaming import StreamingChunk
 from odyssey.data.types import AuxiliaryInputs, ClinicalSequenceBatch
-from odyssey.models.sequence_model import ForecastObjective
+from odyssey.models.backbones.transformer import TransformerBackbone
+from odyssey.models.sequence_model import BaselineSequenceModel, ForecastObjective
 from odyssey.training.event_targets import EventHazardTargets
-from odyssey.training.train import TrainingConfig, build_objective, restrict_to_landmark
+from odyssey.training.train import TrainingConfig, restrict_to_landmark
 from tests.odyssey.training.test_train_transformer import _write_shards
 
 
 def _chunk(lanes: int = 2, seq_len: int = 6) -> StreamingChunk:
-    """A chunk with one patient per row, ending at the last position."""
+    """Build a chunk with one patient per row, ending at the last position."""
     ones = torch.ones(lanes, seq_len)
     patient_end = torch.zeros(lanes, seq_len, dtype=torch.bool)
     patient_end[:, -1] = True
@@ -175,9 +176,6 @@ def test_prefix_positions_are_dropped_from_supervision() -> None:
     next token; positions after it are causal and stay supervised -- that split
     is what separates ``prefix`` from ``encoder``.
     """
-    from odyssey.models.backbones.transformer import TransformerBackbone  # noqa: PLC0415
-    from odyssey.models.sequence_model import BaselineSequenceModel  # noqa: PLC0415
-
     backbone = TransformerBackbone(
         vocab_size=64, hidden_size=16, num_hidden_layers=1, num_heads=2, mode="prefix"
     )
@@ -199,9 +197,6 @@ def test_prefix_positions_are_dropped_from_supervision() -> None:
 
 def test_no_prefix_leaves_the_chunk_untouched() -> None:
     """Every non-prefix backbone leaves ``last_prefix_mask`` at None."""
-    from odyssey.models.backbones.transformer import TransformerBackbone  # noqa: PLC0415
-    from odyssey.models.sequence_model import BaselineSequenceModel  # noqa: PLC0415
-
     model = BaselineSequenceModel(
         TransformerBackbone(
             vocab_size=64, hidden_size=16, num_hidden_layers=1, num_heads=2

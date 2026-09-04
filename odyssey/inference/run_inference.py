@@ -851,6 +851,7 @@ def _build_sampler(
     num_lanes: int,
     chunk_size: int,
     max_context: int,
+    window_stride: int | None = None,
 ) -> PackedLaneSampler | PackedContextSampler:
     """Dispatch on ``backbone``, matching :func:`odyssey.training.train.build_model`.
 
@@ -858,6 +859,12 @@ def _build_sampler(
     -- see :mod:`odyssey.data.packed_context`. Picked from the run's own
     saved config, never a caller-supplied flag: there is no correct
     choice a caller could get wrong instead.
+
+    ``window_stride`` switches long records to overlapping windows instead of
+    tail truncation; it applies to every stateless backbone, not only the
+    transformer the option was written for, since the anchoring artifact it
+    removes is a property of ``PackedContextSampler`` rather than of any one
+    architecture.
 
     Both facts come from :data:`odyssey.models.backbones.BACKBONES`, the same
     place training reads them, so adding a backbone does not mean remembering
@@ -874,6 +881,7 @@ def _build_sampler(
             batch_size=num_lanes,
             max_context=max_context,
             pack=not spec.one_patient_per_row,
+            window_stride=window_stride,
         )
     return PackedLaneSampler(
         patients, num_lanes=num_lanes, chunk_size=chunk_size, reset_prob=0.0
